@@ -1,0 +1,9 @@
+fastapi
+uvicorn[standard]
+twilio
+sarvamai
+websockets
+python-dotenv
+audioop-lts
+pywav
+requests 
