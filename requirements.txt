@@ -112,7 +112,6 @@ ifaddr==0.2.0
 imageio==2.37.0
 imageio-ffmpeg==0.6.0
 importlib_metadata==8.6.1
-insightface==0.7.3
 ipython==8.36.0
 isosurfaces==0.1.2
 itsdangerous==2.2.0
@@ -125,7 +124,6 @@ jsonpatch==1.33
 jsonpointer==3.0.0
 jsonschema==4.23.0
 jsonschema-specifications==2024.10.1
-keras==3.9.2
 kiwisolver==1.4.8
 langchain==0.3.25
 langchain-core==0.3.65
