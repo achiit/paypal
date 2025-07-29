@@ -79,26 +79,33 @@ except Exception as e:
 
 # --- Twilio Webhook for Incoming Calls ---
 @app.post("/incoming_call")
-async def handle_incoming_call(response: Response):
+async def handle_incoming_call(request: Request):
     """
     Handles incoming calls from Twilio.
     Responds with TwiML to connect the call to our WebSocket stream.
     """
     logger.info("Incoming call received")
+    
+    # Log the incoming request for debugging
+    try:
+        form_data = await request.form()
+        logger.info(f"Twilio request data: {dict(form_data)}")
+    except Exception as e:
+        logger.warning(f"Could not parse form data: {e}")
+    
     twiml_response = VoiceResponse()
     
+    # Add a brief greeting before connecting
+    twiml_response.say("Hello! Connecting you to the voice assistant.", voice='alice')
+    
     # The <Connect> verb will establish a media stream
-    # The 'url' should point to your WebSocket endpoint
-    # Note: For local development, you'll need to use a tool like ngrok
-    # to expose your local server to the internet.
-    # The URL would look like: wss://<your-ngrok-subdomain>.ngrok.io/ws
     connect = Connect()
-    # IMPORTANT: Replace the example URL below with your actual ngrok forwarding URL.
-    # Make sure to use 'wss' for a secure WebSocket connection.
-    connect.stream(url="wss://64816b1eb58c.ngrok-free.app/ws")
+    # IMPORTANT: Replace with your actual ngrok URL
+    connect.stream(url="wss://5fd4c229db5f.ngrok-free.app/ws")
     twiml_response.append(connect)
     
     logger.info("Responding with TwiML to connect to WebSocket.")
+    logger.info(f"TwiML Response: {str(twiml_response)}")
     
     return Response(content=str(twiml_response), media_type="application/xml")
 
@@ -108,19 +115,33 @@ async def websocket_endpoint(websocket: WebSocket):
     """
     Handles the bidirectional audio stream with Twilio.
     """
-    await websocket.accept()
-    logger.info("WebSocket connection established with Twilio.")
-    audio_buffer = bytearray()
-    stream_sid = None
-    
     try:
+        # Log connection details for debugging
+        logger.info(f"🔌 WebSocket connection attempt from: {websocket.client}")
+        logger.info(f"🔌 Headers: {dict(websocket.headers)}")
+        
+        await websocket.accept()
+        logger.info("🔌 WebSocket connection established with Twilio.")
+        
+        # Send acknowledgment
+        await websocket.send_json({"type": "connection_established"})
+        
+        audio_buffer = bytearray()
+        stream_sid = None
+        
         while True:
             message = await websocket.receive_json()
             event = message.get("event")
 
             if event == "start":
                 stream_sid = message["start"]["streamSid"]
-                logger.info(f"Twilio media stream started (SID: {stream_sid}).")
+                logger.info(f"🎵 Twilio media stream started (SID: {stream_sid}).")
+                
+                # Send acknowledgment back to Twilio
+                await websocket.send_json({
+                    "event": "start_ack",
+                    "streamSid": stream_sid
+                })
 
             elif event == "media":
                 payload = message["media"]["payload"]
@@ -220,7 +241,7 @@ async def websocket_endpoint(websocket: WebSocket):
                             logger.info(f"Final transcription: {transcription.transcript}")
                     audio_buffer.clear()
                 break
-                
+                       
     except WebSocketDisconnect:
         logger.warning("WebSocket disconnected.")
     except Exception as e:
@@ -425,6 +446,13 @@ async def chat_audio_endpoint(audio_file: UploadFile = File(...), language_code:
 async def health_check():
     """Health check endpoint for Flutter app"""
     return {"status": "healthy", "message": "Voice Assistant API is running"}
+
+@app.get("/test_webhook")
+async def test_webhook():
+    """Test endpoint to verify webhook is working"""
+    twiml_response = VoiceResponse()
+    twiml_response.say("Webhook is working correctly!", voice='alice')
+    return Response(content=str(twiml_response), media_type="application/xml")
 
 @app.get("/api/user/profile")
 async def get_user_profile():
