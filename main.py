@@ -41,6 +41,8 @@ SPLITWISE_API_KEY = os.getenv("SPLITWISE_API_KEY")
 CASHFREE_CLIENT_ID = os.getenv("CASHFREE_CLIENT_ID")
 CASHFREE_CLIENT_SECRET = os.getenv("CASHFREE_CLIENT_SECRET")
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
+PAYPAL_CLIENT_ID = os.getenv("PAYPAL_CLIENT_ID")
+PAYPAL_CLIENT_SECRET = os.getenv("PAYPAL_CLIENT_SECRET")
 
 # Setup logging
 logging.basicConfig(level=logging.INFO)
@@ -635,6 +637,13 @@ TOOLS = [
         "parameters": [
             {"name": "recipient_name", "type": "string", "description": "The name of the person to pay."}
         ]
+    },
+    {
+        "name": "send_payment_reminder",
+        "description": "Sends a payment reminder to someone who owes you money. Use this when the user wants to remind someone to pay them back.",
+        "parameters": [
+            {"name": "recipient_name", "type": "string", "description": "The name of the person who owes money."}
+        ]
     }
 ]
 
@@ -655,6 +664,156 @@ def _get_current_user_identity() -> dict:
     except requests.exceptions.RequestException as e:
         logger.error(f"Failed to fetch current user identity: {e}")
         return {}
+
+def _get_paypal_access_token() -> str:
+    """Get PayPal access token for API calls"""
+    logger.info("Getting PayPal access token...")
+    
+    url = "https://api-m.sandbox.paypal.com/v1/oauth2/token"
+    headers = {
+        'Accept': 'application/json',
+        'Accept-Language': 'en_US',
+    }
+    data = 'grant_type=client_credentials'
+    
+    try:
+        response = requests.post(
+            url, 
+            headers=headers, 
+            data=data,
+            auth=(PAYPAL_CLIENT_ID, PAYPAL_CLIENT_SECRET)
+        )
+        response.raise_for_status()
+        token_data = response.json()
+        access_token = token_data.get('access_token')
+        logger.info("✅ PayPal access token obtained successfully")
+        return access_token
+    except requests.exceptions.RequestException as e:
+        logger.error(f"❌ Failed to get PayPal access token: {e}")
+        return None
+
+def _create_paypal_invoice(recipient_email: str, amount: float, description: str) -> str:
+    """Create a PayPal invoice using the correct flow"""
+    access_token = _get_paypal_access_token()
+    if not access_token:
+        return None
+    
+    logger.info(f"Creating PayPal invoice for {recipient_email} - Amount: ${amount}")
+    
+    url = "https://api-m.sandbox.paypal.com/v2/invoicing/invoices"
+    headers = {
+        'Content-Type': 'application/json',
+        'Authorization': f'Bearer {access_token}',
+    }
+    
+    invoice_data = {
+        "detail": {
+            "currency_code": "USD",
+            "note": f"Payment reminder: {description}"
+        },
+        "invoicer": {
+            "name": {
+                "given_name": "Achintya",
+                "surname": "Singh"
+            }
+        },
+        "primary_recipients": [
+            {
+                "billing_info": {
+                    "email_address": recipient_email
+                }
+            }
+        ],
+        "items": [
+            {
+                "name": description,
+                "quantity": "1",
+                "unit_amount": {
+                    "currency_code": "USD",
+                    "value": str(amount)
+                }
+            }
+        ]
+    }
+    
+    try:
+        response = requests.post(url, headers=headers, json=invoice_data)
+        
+        if response.status_code == 201:
+            invoice_response = response.json()
+            href = invoice_response.get('href', '')
+            if href:
+                invoice_id = href.split('/')[-1]
+                logger.info(f"✅ PayPal invoice created: {invoice_id}")
+                return invoice_id
+        
+        logger.error(f"❌ Failed to create PayPal invoice: {response.text}")
+        return None
+        
+    except requests.exceptions.RequestException as e:
+        logger.error(f"❌ Failed to create PayPal invoice: {e}")
+        return None
+
+def _send_paypal_invoice(invoice_id: str) -> bool:
+    """Send the PayPal invoice"""
+    access_token = _get_paypal_access_token()
+    if not access_token:
+        return False
+    
+    logger.info(f"Sending PayPal invoice: {invoice_id}")
+    
+    url = f"https://api-m.sandbox.paypal.com/v2/invoicing/invoices/{invoice_id}/send"
+    headers = {
+        'Content-Type': 'application/json',
+        'Authorization': f'Bearer {access_token}',
+    }
+    
+    try:
+        response = requests.post(url, headers=headers)
+        
+        if response.status_code in [200, 202]:
+            logger.info(f"✅ PayPal invoice sent successfully")
+            return True
+        else:
+            logger.error(f"❌ Failed to send PayPal invoice: {response.text}")
+            return False
+            
+    except requests.exceptions.RequestException as e:
+        logger.error(f"❌ Failed to send PayPal invoice: {e}")
+        return False
+
+def _send_paypal_invoice_reminder(invoice_id: str, recipient_name: str) -> bool:
+    """Send a payment reminder for a PayPal invoice"""
+    access_token = _get_paypal_access_token()
+    if not access_token:
+        return False
+    
+    logger.info(f"Sending PayPal invoice reminder for invoice: {invoice_id}")
+    
+    url = f"https://api-m.sandbox.paypal.com/v2/invoicing/invoices/{invoice_id}/remind"
+    headers = {
+        'Content-Type': 'application/json',
+        'Authorization': f'Bearer {access_token}',
+    }
+    
+    reminder_data = {
+        "subject": f"Payment Reminder from Achintya",
+        "note": f"Hi {recipient_name}, this is a friendly reminder about your outstanding balance. Please settle when convenient. Thanks!"
+    }
+    
+    try:
+        response = requests.post(url, headers=headers, json=reminder_data)
+        
+        if response.status_code == 204:
+            logger.info(f"✅ PayPal reminder sent successfully to {recipient_name}")
+            return True
+        else:
+            logger.error(f"❌ Failed to send PayPal reminder: {response.text}")
+            return False
+            
+    except requests.exceptions.RequestException as e:
+        logger.error(f"❌ Failed to send PayPal reminder: {e}")
+        return False
 
 def call_tool(tool_name: str, parameters: dict):
     """
@@ -1044,6 +1203,118 @@ def call_tool(tool_name: str, parameters: dict):
         except requests.exceptions.RequestException as e:
             logger.error(f"Cashfree payment link creation failed: {e}")
             return json.dumps({"error": "I tried to create the payment link, but the request to the payment service failed."})
+
+    elif tool_name == "send_payment_reminder":
+        logger.info(f"--- Starting Smart Payment Reminder for: {parameters.get('recipient_name')} ---")
+        recipient_name_query = parameters.get("recipient_name")
+        if not recipient_name_query:
+            return json.dumps({"error": "I need to know who you want to send a reminder to. Please provide a name."})
+
+        # Step 1: Get balances using the existing get_expenses logic
+        logger.info("Step 1: Getting balance information...")
+        balance_result = call_tool("get_expenses", {"type": "balances"})
+        
+        if not balance_result:
+            return json.dumps({"error": "I couldn't retrieve your balance information."})
+        
+        try:
+            balance_data = json.loads(balance_result)
+            balances = balance_data.get('balances', [])
+        except json.JSONDecodeError:
+            return json.dumps({"error": "Error processing balance information."})
+
+        # Step 2: Find the person who owes you money
+        logger.info(f"Step 2: Looking for {recipient_name_query} in balances...")
+        recipient_balance = None
+        
+        for balance in balances:
+            person_name = balance.get('person', '')
+            person_first_name = person_name.split(' ')[0].lower()
+            
+            if recipient_name_query.lower() in person_first_name or person_first_name in recipient_name_query.lower():
+                if balance.get('direction') == 'they_owe_you':
+                    recipient_balance = balance
+                    logger.info(f"✅ Found: {person_name} owes you {balance.get('amount')} rupees")
+                    break
+                else:
+                    return json.dumps({"error": f"You owe {person_name} money, not the other way around. You can't send them a payment reminder."})
+        
+        if not recipient_balance:
+            return json.dumps({"error": f"I couldn't find anyone named {recipient_name_query} who owes you money."})
+
+        # Step 3: Get the person's email from Splitwise
+        logger.info("Step 3: Getting email address from Splitwise...")
+        person_name = recipient_balance.get('person')
+        amount_owed = recipient_balance.get('amount')
+        
+        # Get friends list to find email
+        friends_url = "https://secure.splitwise.com/api/v3.0/get_friends"
+        headers = {
+            'Authorization': f'Bearer {SPLITWISE_API_KEY}',
+            'Content-Type': 'application/json'
+        }
+        
+        try:
+            friends_response = requests.get(friends_url, headers=headers)
+            friends_response.raise_for_status()
+            friends_data = friends_response.json()
+            friends_list = friends_data.get('friends', [])
+            
+            recipient_email = None
+            recipient_full_name = None
+            
+            for friend in friends_list:
+                friend_name = f"{friend.get('first_name', '')} {friend.get('last_name', '')}".strip()
+                if person_name in friend_name or friend_name in person_name:
+                    recipient_email = friend.get('email')
+                    recipient_full_name = friend_name
+                    logger.info(f"✅ Found email: {recipient_email}")
+                    break
+            
+            if not recipient_email:
+                return json.dumps({"error": f"I couldn't find the email address for {person_name}."})
+                
+        except requests.exceptions.RequestException as e:
+            logger.error(f"Failed to get friends list: {e}")
+            return json.dumps({"error": "I couldn't retrieve contact information from Splitwise."})
+
+        # Step 4: Create PayPal invoice
+        logger.info(f"Step 4: Creating PayPal invoice for ₹{amount_owed}")
+        # Convert INR to USD for PayPal (approximate conversion)
+        amount_usd = amount_owed / 83  # Rough INR to USD conversion
+        
+        invoice_id = _create_paypal_invoice(
+            recipient_email, 
+            amount_usd, 
+            f"Outstanding balance: {person_name}"
+        )
+        
+        if not invoice_id:
+            return json.dumps({"error": "I couldn't create the payment reminder invoice. Please try again later."})
+
+        # Step 5: Send the invoice
+        logger.info(f"Step 5: Sending PayPal invoice")
+        invoice_sent = _send_paypal_invoice(invoice_id)
+        
+        if not invoice_sent:
+            return json.dumps({"error": "I created the invoice but couldn't send it. Please try again."})
+
+        # Step 6: Send reminder
+        logger.info(f"Step 6: Sending payment reminder via PayPal")
+        reminder_sent = _send_paypal_invoice_reminder(invoice_id, recipient_full_name)
+        
+        if reminder_sent:
+            return json.dumps({
+                "success": True,
+                "recipient": recipient_full_name,
+                "amount_inr": amount_owed,
+                "amount_usd": round(amount_usd, 2),
+                "invoice_id": invoice_id,
+                "message": f"Payment reminder sent to {recipient_full_name} for ₹{amount_owed:.2f} (${amount_usd:.2f}) via PayPal invoice {invoice_id}"
+            })
+        else:
+            return json.dumps({"error": "The invoice was sent but I couldn't send the reminder. Please try again."})
+
     else:
         logger.warning(f"LLM tried to call an unknown tool: {tool_name}")
         return json.dumps({"error": "Unknown tool."})
@@ -1120,9 +1391,7 @@ def normalize_query(text: str) -> str:
         'balances': 'show my expenses',
         'outstanding': 'show my expenses',
         
-        'send payment reminder': 'show my expenses',
-        'payment reminder': 'show my expenses',
-        'remind payment': 'show my expenses',
+        # Removed payment reminder normalization - let keyword detection handle it
     }
     
     # Check for exact matches first
@@ -1198,14 +1467,32 @@ Available tools: {json.dumps(TOOLS, indent=2)}
     # Pre-determine tool based on keywords (more reliable than LLM for voice)
     def determine_tool_by_keywords(query: str) -> dict:
         query_lower = query.lower()
+        logger.info(f"🔍 KEYWORD DETECTION - Query: '{query_lower}'")
         
         # Profile/user related keywords
         profile_keywords = ['profile', 'details', 'account', 'user', 'my details', 'who am i']
         if any(keyword in query_lower for keyword in profile_keywords):
             return {"tool_name": "get_current_user", "parameters": {}}
         
-        # Check for person-specific balance queries
+        # Check for payment reminder requests FIRST (highest priority)
         person_names = ['aditya', 'nishant', 'omkar', 'dainik']
+        reminder_keywords = ['send reminder', 'payment reminder', 'remind', 'send payment reminder', 'reminder to']
+        
+        logger.info(f"🔍 Checking reminder keywords: {reminder_keywords}")
+        for keyword in reminder_keywords:
+            if keyword in query_lower:
+                logger.info(f"🎯 FOUND REMINDER KEYWORD: '{keyword}'")
+                # Find person in the query
+                for person in person_names:
+                    if person in query_lower:
+                        logger.info(f"🎯 DETECTED PAYMENT REMINDER REQUEST for: {person}")
+                        return {"tool_name": "send_payment_reminder", "parameters": {"recipient_name": person}}
+                
+                # If no specific person found, still return reminder tool
+                logger.info(f"🎯 DETECTED PAYMENT REMINDER REQUEST but no person found")
+                return {"tool_name": "send_payment_reminder", "parameters": {"recipient_name": "unknown"}}
+        
+        # Check for person-specific balance queries (lower priority)
         person_specific_keywords = ['take from', 'owe', 'from', 'with']
         
         # If asking about a specific person
@@ -1216,11 +1503,13 @@ Available tools: {json.dumps(TOOLS, indent=2)}
                 break
         
         if mentioned_person and any(keyword in query_lower for keyword in person_specific_keywords):
-            return {"tool_name": "get_expenses", "parameters": {"type": "person_specific", "person": mentioned_person}}
+            # Make sure it's not a reminder request that we missed
+            if not any(reminder_word in query_lower for reminder_word in ['remind', 'reminder', 'send']):
+                return {"tool_name": "get_expenses", "parameters": {"type": "person_specific", "person": mentioned_person}}
         
         # Check if asking for actual expense transactions vs balances
         expense_transaction_keywords = ['last', 'recent expenses', 'my expenses', 'expense list', 'transactions', 'what did i spend']
-        balance_keywords = ['owe', 'take', 'balances', 'outstanding', 'payment', 'reminder', 'how much money', 'who owes']
+        balance_keywords = ['owe', 'take', 'balances', 'outstanding', 'payment', 'how much money', 'who owes']
         
         # If asking for expense transactions specifically
         if any(keyword in query_lower for keyword in expense_transaction_keywords):
