@@ -15,6 +15,7 @@ from pydantic import BaseModel
 from fastapi.middleware.cors import CORSMiddleware
 from twilio.twiml.voice_response import VoiceResponse, Connect
 from sarvamai import SarvamAI
+import google.generativeai as genai
 from dotenv import load_dotenv
 from nnmnkwii.preprocessing import mulaw_quantize, inv_mulaw_quantize, mulaw, inv_mulaw
 from datetime import datetime
@@ -39,6 +40,7 @@ TOOLS_API_BASE_URL = os.getenv("TOOLS_API_BASE_URL")
 SPLITWISE_API_KEY = os.getenv("SPLITWISE_API_KEY")
 CASHFREE_CLIENT_ID = os.getenv("CASHFREE_CLIENT_ID")
 CASHFREE_CLIENT_SECRET = os.getenv("CASHFREE_CLIENT_SECRET")
+GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 
 # Setup logging
 logging.basicConfig(level=logging.INFO)
@@ -69,13 +71,22 @@ async def get_chat_interface():
 
 
 
-# Initialize SarvamAI client
+# Initialize SarvamAI client (for speech-to-text and text-to-speech)
 try:
     sarvam_client = SarvamAI(api_subscription_key=SARVAM_API_KEY)
     logger.info("SarvamAI client initialized successfully.")
 except Exception as e:
     logger.error(f"Failed to initialize SarvamAI client: {e}")
     sarvam_client = None
+
+# Initialize Gemini client (for LLM)
+try:
+    genai.configure(api_key=GEMINI_API_KEY)
+    gemini_model = genai.GenerativeModel('gemini-2.5-flash')
+    logger.info("Gemini client initialized successfully.")
+except Exception as e:
+    logger.error(f"Failed to initialize Gemini client: {e}")
+    gemini_model = None
 
 # --- Twilio Webhook for Incoming Calls ---
 @app.post("/incoming_call")
@@ -667,104 +678,229 @@ def call_tool(tool_name: str, parameters: dict):
         return json.dumps(user_info)
     
     elif tool_name == "get_expenses":
-        logger.info("Executing tool: get_expenses - calling Splitwise directly")
+        expense_type = parameters.get("type", "balances")  # Default to balances
+        logger.info(f"Executing tool: get_expenses - type: {expense_type}")
+        
         url = "https://secure.splitwise.com/api/v3.0/get_expenses"
         headers = {
             'Authorization': f'Bearer {SPLITWISE_API_KEY}',
             'Content-Type': 'application/json'
         }
         try:
-            response = requests.get(f"{url}?limit=20", headers=headers)
+            response = requests.get(f"{url}?limit=50", headers=headers)  # Increased limit to get more records
             response.raise_for_status()
             expenses_data = response.json()
             
             expenses_list = expenses_data.get('expenses', [])
             logger.info(f"Successfully fetched {len(expenses_list)} expenses from Splitwise")
             
-            # Get current user info for balance calculations
+            # Get current user info
             current_user = _get_current_user_identity()
             current_user_id = current_user.get('id') if current_user else None
             logger.info(f"Current user ID: {current_user_id}")
             
-            # Calculate net balances with each person
-            person_balances = {}  # person_name -> net_amount (positive = they owe you, negative = you owe them)
-            expense_details = []
-            
-            for expense in expenses_list:
-                if expense.get('payment', False):  # Skip payment entries
-                    continue
-                    
-                users = expense.get('users', [])
-                current_user_balance = 0
-                other_users = []
+            if expense_type == "transactions":
+                # Debug: Let's see what we're getting from Splitwise
+                logger.info(f"DEBUG: Total records from Splitwise: {len(expenses_list)}")
                 
-                # Find current user's balance and other users in this expense
-                for user in users:
-                    user_info = user.get('user', {})
-                    user_id = user_info.get('id')
-                    user_name = f"{user_info.get('first_name', '')} {user_info.get('last_name', '')}".strip()
+                payment_count = 0
+                expense_count = 0
+                
+                for i, expense in enumerate(expenses_list):
+                    is_payment = expense.get('payment', False)
+                    description = expense.get('description', 'No description')
+                    cost = expense.get('cost', 0)
+                    date = expense.get('date', 'No date')
                     
-                    # net_balance in Splitwise: positive = they get money, negative = they owe money
-                    net_balance = float(user.get('net_balance', 0))
-                    
-                    if user_id == current_user_id:
-                        current_user_balance = net_balance
+                    if is_payment:
+                        payment_count += 1
+                        logger.info(f"DEBUG: Record {i+1} - PAYMENT: {description} - {cost} - {date}")
                     else:
-                        other_users.append({
-                            'name': user_name,
-                            'balance': net_balance
+                        expense_count += 1
+                        logger.info(f"DEBUG: Record {i+1} - EXPENSE: {description} - {cost} - {date}")
+                
+                logger.info(f"DEBUG: Found {expense_count} expenses and {payment_count} payments")
+                
+                # Return actual expense transactions - filter out payments first, then take 5
+                expense_transactions = []
+                count = 0
+                
+                for expense in expenses_list:
+                    if expense.get('payment', False):  # Skip payment entries
+                        continue
+                    
+                    expense_transactions.append({
+                        "description": expense.get('description', 'Unknown expense'),
+                        "amount": float(expense.get('cost', 0)),
+                        "date": expense.get('date', '').split('T')[0] if expense.get('date') else '',
+                        "currency": expense.get('currency_code', 'INR')
+                    })
+                    
+                    count += 1
+                    if count >= 5:  # Stop after 5 actual expenses
+                        break
+                
+                result = {
+                    "type": "transactions",
+                    "transactions": expense_transactions,
+                    "total_amount": sum(t['amount'] for t in expense_transactions),
+                    "requested_count": 5,
+                    "actual_count": len(expense_transactions),
+                    "debug_info": {
+                        "total_records": len(expenses_list),
+                        "expense_records": expense_count,
+                        "payment_records": payment_count
+                    }
+                }
+                
+                logger.info(f"Returning {len(expense_transactions)} expense transactions out of {len(expenses_list)} total records")
+                return json.dumps(result)
+            
+            elif expense_type == "person_specific":
+                # Handle person-specific balance queries
+                target_person = parameters.get("person", "").lower()
+                logger.info(f"Looking for balance with person: {target_person}")
+                
+                # Calculate balances (same logic as before)
+                person_balances = {}
+                
+                for expense in expenses_list:
+                    if expense.get('payment', False):
+                        continue
+                        
+                    users = expense.get('users', [])
+                    current_user_balance = 0
+                    other_users = []
+                    
+                    for user in users:
+                        user_info = user.get('user', {})
+                        user_id = user_info.get('id')
+                        user_name = f"{user_info.get('first_name', '')} {user_info.get('last_name', '')}".strip()
+                        net_balance = float(user.get('net_balance', 0))
+                        
+                        if user_id == current_user_id:
+                            current_user_balance = net_balance
+                        else:
+                            other_users.append({
+                                'name': user_name,
+                                'balance': net_balance
+                            })
+                    
+                    if current_user_balance < 0:
+                        for other_user in other_users:
+                            if other_user['balance'] > 0:
+                                person_name = other_user['name']
+                                amount = abs(current_user_balance)
+                                
+                                if person_name not in person_balances:
+                                    person_balances[person_name] = 0
+                                person_balances[person_name] -= amount
+                                
+                    elif current_user_balance > 0:
+                        for other_user in other_users:
+                            if other_user['balance'] < 0:
+                                person_name = other_user['name']
+                                amount = abs(other_user['balance'])
+                                
+                                if person_name not in person_balances:
+                                    person_balances[person_name] = 0
+                                person_balances[person_name] += amount
+                
+                # Find the specific person
+                found_person = None
+                found_balance = 0
+                
+                for person, net_amount in person_balances.items():
+                    person_first_name = person.split(' ')[0].lower()
+                    if target_person in person_first_name or person_first_name in target_person:
+                        found_person = person
+                        found_balance = net_amount
+                        break
+                
+                result = {
+                    "type": "person_specific",
+                    "person": found_person,
+                    "balance": found_balance,
+                    "direction": "they_owe_you" if found_balance > 0 else "you_owe_them" if found_balance < 0 else "settled"
+                }
+                
+                logger.info(f"Person-specific result: {result}")
+                return json.dumps(result)
+            
+            else:
+                # Calculate net balances (existing logic)
+                person_balances = {}
+                expense_details = []
+                
+                for expense in expenses_list:
+                    if expense.get('payment', False):
+                        continue
+                        
+                    users = expense.get('users', [])
+                    current_user_balance = 0
+                    other_users = []
+                    
+                    for user in users:
+                        user_info = user.get('user', {})
+                        user_id = user_info.get('id')
+                        user_name = f"{user_info.get('first_name', '')} {user_info.get('last_name', '')}".strip()
+                        net_balance = float(user.get('net_balance', 0))
+                        
+                        if user_id == current_user_id:
+                            current_user_balance = net_balance
+                        else:
+                            other_users.append({
+                                'name': user_name,
+                                'balance': net_balance
+                            })
+                    
+                    if current_user_balance < 0:
+                        for other_user in other_users:
+                            if other_user['balance'] > 0:
+                                person_name = other_user['name']
+                                amount = abs(current_user_balance)
+                                
+                                if person_name not in person_balances:
+                                    person_balances[person_name] = 0
+                                person_balances[person_name] -= amount
+                                
+                    elif current_user_balance > 0:
+                        for other_user in other_users:
+                            if other_user['balance'] < 0:
+                                person_name = other_user['name']
+                                amount = abs(other_user['balance'])
+                                
+                                if person_name not in person_balances:
+                                    person_balances[person_name] = 0
+                                person_balances[person_name] += amount
+                    
+                    expense_details.append({
+                        "description": expense.get('description', ''),
+                        "amount": expense.get('cost', '0'),
+                        "date": expense.get('date', '').split('T')[0] if expense.get('date') else '',
+                        "your_balance": current_user_balance,
+                        "currency": expense.get('currency_code', 'INR')
+                    })
+                
+                balance_summary = []
+                for person, net_amount in person_balances.items():
+                    if abs(net_amount) > 0.01:
+                        balance_summary.append({
+                            "person": person,
+                            "amount": abs(net_amount),
+                            "direction": "they_owe_you" if net_amount > 0 else "you_owe_them",
+                            "amount_formatted": f"₹{abs(net_amount):.2f}"
                         })
                 
-                # If current user has negative balance, they owe money
-                # If others have negative balance, they owe money
-                if current_user_balance < 0:  # Current user owes money
-                    for other_user in other_users:
-                        if other_user['balance'] > 0:  # This person is owed money
-                            person_name = other_user['name']
-                            amount = abs(current_user_balance)  # Amount current user owes
-                            
-                            if person_name not in person_balances:
-                                person_balances[person_name] = 0
-                            person_balances[person_name] -= amount  # Negative = you owe them
-                            
-                elif current_user_balance > 0:  # Current user is owed money
-                    for other_user in other_users:
-                        if other_user['balance'] < 0:  # This person owes money
-                            person_name = other_user['name']
-                            amount = abs(other_user['balance'])  # Amount they owe
-                            
-                            if person_name not in person_balances:
-                                person_balances[person_name] = 0
-                            person_balances[person_name] += amount  # Positive = they owe you
+                result = {
+                    "type": "balances",
+                    "balances": balance_summary,
+                    "recent_expenses": expense_details[:10],
+                    "total_people": len(balance_summary)
+                }
                 
-                # Add expense details
-                expense_details.append({
-                    "description": expense.get('description', ''),
-                    "amount": expense.get('cost', '0'),
-                    "date": expense.get('date', '').split('T')[0] if expense.get('date') else '',
-                    "your_balance": current_user_balance,
-                    "currency": expense.get('currency_code', 'INR')
-                })
-            
-            # Format the final result
-            balance_summary = []
-            for person, net_amount in person_balances.items():
-                if abs(net_amount) > 0.01:  # Ignore very small amounts
-                    balance_summary.append({
-                        "person": person,
-                        "amount": abs(net_amount),
-                        "direction": "they_owe_you" if net_amount > 0 else "you_owe_them",
-                        "amount_formatted": f"₹{abs(net_amount):.2f}"
-                    })
-            
-            result = {
-                "balances": balance_summary,
-                "recent_expenses": expense_details[:10],
-                "total_people": len(balance_summary)
-            }
-            
-            logger.info(f"Calculated balances: {balance_summary}")
-            return json.dumps(result)
+                logger.info(f"Calculated balances: {balance_summary}")
+                return json.dumps(result)
             
         except requests.exceptions.RequestException as e:
             logger.error(f"Splitwise API call failed: {e}")
@@ -996,12 +1132,41 @@ def normalize_query(text: str) -> str:
     
     return text
 
+def format_amount_for_speech(amount: float) -> str:
+    """
+    Convert numeric amounts to speech-friendly text
+    """
+    # Round to nearest rupee for clarity
+    rounded_amount = round(amount)
+    
+    if rounded_amount == 0:
+        return "zero rupees"
+    elif rounded_amount == 1:
+        return "one rupee"
+    elif rounded_amount < 100:
+        return f"{rounded_amount} rupees"
+    elif rounded_amount < 1000:
+        return f"{rounded_amount} rupees"
+    else:
+        # For larger amounts, make them more speech-friendly
+        if rounded_amount >= 1000:
+            thousands = rounded_amount // 1000
+            remainder = rounded_amount % 1000
+            if remainder == 0:
+                return f"{thousands} thousand rupees"
+            else:
+                return f"{thousands} thousand {remainder} rupees"
+    
+    return f"{rounded_amount} rupees"
+
+# Removed hardcoded response formatter - now using Gemini for all responses
+
 def get_llm_response(text: str, language_code: str = "en-IN"):
     """
-    Manages the interaction with the LLM, including tool-calling logic.
+    Manages the interaction with the LLM using Gemini, including tool-calling logic.
     """
-    if not sarvam_client:
-        logger.error("SarvamAI client not available.")
+    if not gemini_model:
+        logger.error("Gemini client not available.")
         return "The AI model is currently unavailable. Please try again later."
 
     # Normalize the input query for better consistency
@@ -1010,7 +1175,7 @@ def get_llm_response(text: str, language_code: str = "en-IN"):
 
     # 1. First Pass: Tool Selection with more explicit rules
     system_prompt_for_tool_selection = f"""
-You are a financial assistant. Analyze the user query and respond with the appropriate tool or conversation.
+You are a professional financial assistant. Analyze the user query and respond with the appropriate tool or conversation.
 
 STRICT RULES:
 1. If query contains ANY of these words/phrases → use get_expenses tool:
@@ -1019,11 +1184,11 @@ STRICT RULES:
 
 2. If query asks about "profile", "details", "account", "user" → use get_current_user tool
 
-3. If query is greeting/casual → respond conversationally
+3. If query is greeting/casual → respond conversationally in English with proper speech formatting
 
 4. For tool usage, respond ONLY with JSON: {{"tool_name": "tool_name", "parameters": {{}}}}
 
-5. For conversation, respond naturally in {language_code}
+5. For conversation, respond naturally in English with proper punctuation and speech-friendly formatting
 
 Query: "{normalized_text}"
 
@@ -1039,20 +1204,47 @@ Available tools: {json.dumps(TOOLS, indent=2)}
         if any(keyword in query_lower for keyword in profile_keywords):
             return {"tool_name": "get_current_user", "parameters": {}}
         
-        # Expense/money related keywords
-        expense_keywords = ['money', 'owe', 'take', 'expenses', 'balances', 'outstanding', 
-                           'payment', 'reminder', 'how much', 'show', 'recent', 'transactions', 
-                           'bills', 'aditya', 'nishant', 'omkar', 'dainik']
-        if any(keyword in query_lower for keyword in expense_keywords):
-            return {"tool_name": "get_expenses", "parameters": {}}
+        # Check for person-specific balance queries
+        person_names = ['aditya', 'nishant', 'omkar', 'dainik']
+        person_specific_keywords = ['take from', 'owe', 'from', 'with']
+        
+        # If asking about a specific person
+        mentioned_person = None
+        for person in person_names:
+            if person in query_lower:
+                mentioned_person = person
+                break
+        
+        if mentioned_person and any(keyword in query_lower for keyword in person_specific_keywords):
+            return {"tool_name": "get_expenses", "parameters": {"type": "person_specific", "person": mentioned_person}}
+        
+        # Check if asking for actual expense transactions vs balances
+        expense_transaction_keywords = ['last', 'recent expenses', 'my expenses', 'expense list', 'transactions', 'what did i spend']
+        balance_keywords = ['owe', 'take', 'balances', 'outstanding', 'payment', 'reminder', 'how much money', 'who owes']
+        
+        # If asking for expense transactions specifically
+        if any(keyword in query_lower for keyword in expense_transaction_keywords):
+            return {"tool_name": "get_expenses", "parameters": {"type": "transactions"}}
+        
+        # If asking for balances/who owes what
+        elif any(keyword in query_lower for keyword in balance_keywords):
+            return {"tool_name": "get_expenses", "parameters": {"type": "balances"}}
+        
+        # General expense keywords - default to balances
+        elif any(keyword in query_lower for keyword in ['expenses', 'money', 'bills']):
+            return {"tool_name": "get_expenses", "parameters": {"type": "balances"}}
+        
+        # If person name mentioned but not specific query, show balances
+        elif mentioned_person:
+            return {"tool_name": "get_expenses", "parameters": {"type": "balances"}}
         
         # Greeting keywords
         greeting_keywords = ['hi', 'hello', 'hey', 'good morning', 'good evening', 'how are you']
         if any(keyword in query_lower for keyword in greeting_keywords):
             return None  # No tool needed
         
-        # Default to expenses for ambiguous queries
-        return {"tool_name": "get_expenses", "parameters": {}}
+        # Default to balances for ambiguous queries
+        return {"tool_name": "get_expenses", "parameters": {"type": "balances"}}
     
     # Try keyword-based tool determination first (more reliable for voice)
     keyword_tool = determine_tool_by_keywords(normalized_text)
@@ -1073,24 +1265,30 @@ Available tools: {json.dumps(TOOLS, indent=2)}
                 return "I couldn't retrieve the information you requested. Please try again."
             
             # Generate final response using the tool result
-            system_prompt_for_final_response = f"""You are a financial assistant. Give direct, clear answers based on the expense data provided.
+            system_prompt_for_final_response = f"""You are a professional financial assistant. Create natural, conversational responses optimized for text-to-speech.
 
-LANGUAGE: Respond in {language_code}.
+LANGUAGE: Always respond in English, regardless of input language.
 
-RULES:
-1. When user asks "How much money do I have to take from [person]" → Show money THEY owe YOU (direction: "they_owe_you")
-2. When user asks "What do I owe [person]" → Show money YOU owe THEM (direction: "you_owe_them")
-3. When user asks "Send payment reminder to [person]" → Show money YOU owe THEM (direction: "you_owe_them")
-4. Be specific with amounts and currency
-5. Use plain text, no formatting
+SPEECH OPTIMIZATION RULES:
+1. Use proper punctuation and natural pauses
+2. Spell out numbers clearly (e.g., "four hundred seventy-two rupees" not "472.01 rupees")
+3. Use conversational phrases like "Here's what I found", "Let me tell you", "Currently"
+4. Add natural transitions between items
+5. Keep sentences short and clear for better speech flow
+6. Use "and" instead of line breaks between items
+
+CONTENT RULES:
+1. For "they_owe_you": Say "[Person] owes you [amount]"
+2. For "you_owe_them": Say "You owe [Person] [amount]"
+3. Round amounts to nearest rupee for speech clarity
+4. Group similar information together
+5. Start with a friendly acknowledgment
 
 EXAMPLES:
-- If data shows Aditya with direction "they_owe_you" and amount 50: "Aditya owes you 50 rupees"
-- If data shows John with direction "you_owe_them" and amount 100: "You owe John 100 rupees"
-- If no balance found: "There are no outstanding balances with [person]"
-- For payment reminders: Focus on what YOU owe THEM
+- Good: "Here's your current balance summary. Aditya owes you four hundred seventy-two rupees, and Nishant owes you three hundred fifty-eight rupees. However, you owe Omkar seventy-five rupees."
+- Bad: "Aditya Singh (Tech) owes you 472.01 rupeesYou owe Omkar Ghongade 75.00 rupees"
 
-Answer directly based on the balance data provided."""
+Create a natural, flowing response that sounds professional when spoken aloud."""
             
             final_messages = [
                 {"role": "system", "content": system_prompt_for_final_response},
@@ -1099,15 +1297,66 @@ Answer directly based on the balance data provided."""
                 {"role": "user", "content": "Now, please give me the final answer based on this information."}
             ]
             
-            logger.info(f"Sending tool result to LLM for final response generation.")
-            final_response = sarvam_client.chat.completions(
-                messages=final_messages,
-                max_tokens=300,
-                temperature=0.7,
-            )
-            final_content = final_response.choices[0].message.content
-            logger.info(f"Received from LLM (final response): {final_content}")
-            return final_content
+            logger.info(f"Sending tool result to Gemini for final response generation.")
+            
+            # Use Gemini to generate intelligent, contextual responses
+            gemini_prompt = f"""
+You are a professional financial assistant. Create clear, helpful responses optimized for text-to-speech.
+
+CONTEXT:
+- User asked: "{text}"
+- Tool used: {tool_name}
+- Data retrieved: {tool_result}
+
+TONE & STYLE:
+- Professional but friendly
+- Direct and informative
+- Don't pretend to not know common things (like "Poha" - it's a common Indian breakfast)
+- Avoid over-enthusiasm or fake curiosity
+- Be helpful without being pushy
+- Sound knowledgeable and competent
+
+SPEECH OPTIMIZATION:
+- Always respond in English
+- Use proper punctuation and natural pauses
+- Spell out numbers clearly (e.g., "four hundred seventy-two rupees")
+- Keep sentences clear and well-structured
+
+RESPONSE GUIDELINES:
+1. For expense transactions: List them clearly with amounts and dates
+2. For person-specific queries: Give direct, specific answers
+3. For profile info: Present information clearly
+4. If user asked for 5 expenses but only 2 exist, acknowledge this
+5. Focus on the facts, not unnecessary commentary
+
+Create a professional, helpful response that directly addresses what the user asked for.
+"""
+            
+            try:
+                logger.info(f"📤 SENDING TO GEMINI - Prompt: {gemini_prompt}")
+                logger.info(f"📤 SENDING TO GEMINI - Tool Result: {tool_result}")
+                
+                final_response = gemini_model.generate_content(
+                    gemini_prompt,
+                    generation_config=genai.types.GenerationConfig(
+                        max_output_tokens=1000,
+                        temperature=0.8,
+                    )
+                )
+                
+                logger.info(f"📥 RAW GEMINI RESPONSE: {final_response}")
+                final_content = final_response.text.strip() if final_response.text else ""
+                
+                if not final_content:
+                    logger.warning("⚠️ Gemini returned empty response, using fallback")
+                    final_content = "I found the information you requested, but I'm having trouble generating a response right now. Please try again."
+                
+                logger.info(f"📥 FINAL CONTENT: {final_content}")
+                return final_content
+                
+            except Exception as e:
+                logger.error(f"❌ Gemini failed: {e}")
+                return "I found the information you requested, but I'm having trouble generating a response right now. Please try again."
     
     # Fallback to LLM-based tool selection for complex queries
     messages = [
@@ -1115,15 +1364,20 @@ Answer directly based on the balance data provided."""
         {"role": "user", "content": normalized_text}
     ]
     
-    logger.info(f"Using LLM for tool selection: {normalized_text}")
+    logger.info(f"Using Gemini for tool selection: {normalized_text}")
     try:
-        response = sarvam_client.chat.completions(
-            messages=messages,
-            max_tokens=550,
-            temperature=0.0,
+        # Convert to Gemini format
+        gemini_prompt = f"{system_prompt_for_tool_selection}\n\nUser query: {normalized_text}"
+        
+        response = gemini_model.generate_content(
+            gemini_prompt,
+            generation_config=genai.types.GenerationConfig(
+                max_output_tokens=550,
+                temperature=0.0,
+            )
         )
-        llm_output = response.choices[0].message.content.strip()
-        logger.info(f"Received from LLM (initial pass): {llm_output}")
+        llm_output = response.text.strip()
+        logger.info(f"Received from Gemini (initial pass): {llm_output}")
 
         # Handle empty or whitespace-only responses
         if not llm_output:
@@ -1148,24 +1402,30 @@ Answer directly based on the balance data provided."""
                 
                 # 4. Second Pass: Generate Final Response
                 # Now we send the tool's result back to the LLM to generate a human-friendly response.
-                system_prompt_for_final_response = f"""You are a financial assistant. Give direct, clear answers based on the expense data provided.
+                system_prompt_for_final_response = f"""You are a professional financial assistant. Create natural, conversational responses optimized for text-to-speech.
 
-LANGUAGE: Respond in {language_code}.
+LANGUAGE: Always respond in English, regardless of input language.
 
-RULES:
-1. When user asks "How much money do I have to take from [person]" → Show money THEY owe YOU (direction: "they_owe_you")
-2. When user asks "What do I owe [person]" → Show money YOU owe THEM (direction: "you_owe_them")
-3. When user asks "Send payment reminder to [person]" → Show money YOU owe THEM (direction: "you_owe_them")
-4. Be specific with amounts and currency
-5. Use plain text, no formatting
+SPEECH OPTIMIZATION RULES:
+1. Use proper punctuation and natural pauses
+2. Spell out numbers clearly (e.g., "four hundred seventy-two rupees" not "472.01 rupees")
+3. Use conversational phrases like "Here's what I found", "Let me tell you", "Currently"
+4. Add natural transitions between items
+5. Keep sentences short and clear for better speech flow
+6. Use "and" instead of line breaks between items
+
+CONTENT RULES:
+1. For "they_owe_you": Say "[Person] owes you [amount]"
+2. For "you_owe_them": Say "You owe [Person] [amount]"
+3. Round amounts to nearest rupee for speech clarity
+4. Group similar information together
+5. Start with a friendly acknowledgment
 
 EXAMPLES:
-- If data shows Aditya with direction "they_owe_you" and amount 50: "Aditya owes you 50 rupees"
-- If data shows John with direction "you_owe_them" and amount 100: "You owe John 100 rupees"
-- If no balance found: "There are no outstanding balances with [person]"
-- For payment reminders: Focus on what YOU owe THEM
+- Good: "Here's your current balance summary. Aditya owes you four hundred seventy-two rupees, and Nishant owes you three hundred fifty-eight rupees. However, you owe Omkar seventy-five rupees."
+- Bad: "Aditya Singh (Tech) owes you 472.01 rupeesYou owe Omkar Ghongade 75.00 rupees"
 
-Answer directly based on the balance data provided."""
+Create a natural, flowing response that sounds professional when spoken aloud."""
                 
                 final_messages = [
                     {"role": "system", "content": system_prompt_for_final_response},
@@ -1174,15 +1434,67 @@ Answer directly based on the balance data provided."""
                     {"role": "user", "content": "Now, please give me the final answer based on this information."}
                 ]
                 
-                logger.info(f"Sending tool result to LLM for final response generation.")
-                final_response = sarvam_client.chat.completions(
-                    messages=final_messages,
-                    max_tokens=300, # Increased from 100 to allow for a full, detailed response
-                    temperature=0.7,
-                )
-                logger.info(f"Final response: {final_response}")
-                final_content = final_response.choices[0].message.content
-                logger.info(f"Received from LLM (final response): {final_content}")
+                logger.info(f"Sending tool result to Gemini for final response generation.")
+                
+                # Use Gemini to generate intelligent, contextual responses
+                gemini_final_prompt = f"""
+You are a professional financial assistant. Create clear, helpful responses optimized for text-to-speech.
+
+CONTEXT:
+- User asked: "{text}"
+- Tool used: {tool_name}
+- Data retrieved: {tool_result}
+
+TONE & STYLE:
+- Professional but friendly
+- Direct and informative
+- Don't pretend to not know common things (like "Poha" - it's a common Indian breakfast)
+- Avoid over-enthusiasm or fake curiosity
+- Be helpful without being pushy
+- Sound knowledgeable and competent
+
+SPEECH OPTIMIZATION:
+- Always respond in English
+- Use proper punctuation and natural pauses
+- Spell out numbers clearly (e.g., "four hundred seventy-two rupees")
+- Keep sentences clear and well-structured
+
+RESPONSE GUIDELINES:
+1. For expense transactions: List them clearly with amounts and dates
+2. For person-specific queries: Give direct, specific answers
+3. For profile info: Present information clearly
+4. If user asked for 5 expenses but only 2 exist, acknowledge this
+5. Focus on the facts, not unnecessary commentary
+
+Create a professional, helpful response that directly addresses what the user asked for.
+"""
+                
+                try:
+                    logger.info(f"📤 SENDING TO GEMINI (Fallback) - Prompt: {gemini_final_prompt}")
+                    logger.info(f"📤 SENDING TO GEMINI (Fallback) - Tool Result: {tool_result}")
+                    
+                    final_response = gemini_model.generate_content(
+                        gemini_final_prompt,
+                        generation_config=genai.types.GenerationConfig(
+                            max_output_tokens=300,
+                            temperature=0.8,
+                        )
+                    )
+                    
+                    logger.info(f"📥 RAW GEMINI RESPONSE (Fallback): {final_response}")
+                    final_content = final_response.text.strip() if final_response.text else ""
+                    
+                    if not final_content:
+                        logger.warning("⚠️ Gemini returned empty response, using fallback")
+                        final_content = "I found the information you requested, but I'm having trouble generating a response right now. Please try again."
+                    
+                    logger.info(f"📥 FINAL CONTENT (Fallback): {final_content}")
+                    
+                except Exception as e:
+                    logger.error(f"❌ Gemini failed: {e}")
+                    final_content = "I found the information you requested, but I'm having trouble generating a response right now. Please try again."
+                
+                logger.info(f"Intelligent Gemini response: {final_content}")
                 return final_content
             else:
                 # If it's valid JSON but not a tool call, treat as conversational
@@ -1193,11 +1505,68 @@ Answer directly based on the balance data provided."""
             logger.info("LLM response is conversational, not a tool call.")
             # Handle edge cases where response might be just "{}" or similar
             if llm_output.strip() in ["{}", "[]", ""]:
-                return "Hello! I'm your financial assistant. How can I help you today?"
-            return llm_output
+                return "Hello! I'm your personal financial assistant. I can help you check your expenses, balances, and manage payments. What would you like to know?"
+            
+            # Use Gemini for conversational responses too
+            if any(greeting in normalized_text for greeting in ['hi', 'hello', 'hey', 'good morning', 'good evening']):
+                greeting_prompt = f"""
+You are a professional financial assistant. The user greeted you with: "{text}"
+
+Create a brief, professional greeting that:
+- Sounds natural and friendly but not overly enthusiastic
+- Briefly mentions what you can help with (checking expenses, balances, payments)
+- Is optimized for text-to-speech
+- Keeps it concise and to the point
+
+Avoid being too chatty or fake-friendly.
+"""
+                
+                logger.info(f"📤 SENDING TO GEMINI (Greeting) - Prompt: {greeting_prompt}")
+                
+                greeting_response = gemini_model.generate_content(
+                    greeting_prompt,
+                    generation_config=genai.types.GenerationConfig(
+                        max_output_tokens=80,
+                        temperature=0.6,
+                    )
+                )
+                
+                logger.info(f"📥 RAW GEMINI RESPONSE (Greeting): {greeting_response}")
+                response_text = greeting_response.text.strip() if greeting_response.text else ""
+                
+                if not response_text:
+                    logger.warning("⚠️ Gemini greeting returned empty response")
+                    response_text = "Hello! I'm your financial assistant. I can help you check your expenses, balances, and payments. What would you like to know?"
+                
+                logger.info(f"📥 FINAL GREETING: {response_text}")
+                return response_text
+            
+            # For other conversational responses, also use Gemini
+            conversation_prompt = f"""
+You are a professional financial assistant. The user said: "{text}"
+
+This doesn't seem to be a specific request for financial data.
+
+Respond professionally and helpfully:
+- Keep it brief and to the point
+- Don't be overly chatty or enthusiastic
+- Gently guide them toward what you can help with
+- Sound competent and professional
+
+Focus on being helpful rather than entertaining.
+"""
+            
+            conversation_response = gemini_model.generate_content(
+                conversation_prompt,
+                generation_config=genai.types.GenerationConfig(
+                    max_output_tokens=100,
+                    temperature=0.6,  # Lower temperature for consistency
+                )
+            )
+            return conversation_response.text
 
     except Exception as e:
-        logger.error(f"LLM request failed: {e}", exc_info=True)
+        logger.error(f"Gemini request failed: {e}", exc_info=True)
         return "I'm sorry, I had trouble processing your request."
 
 # --- SarvamAI Text-to-Speech (TTS) Function ---
@@ -1210,6 +1579,11 @@ def convert_text_to_speech(text: str, language_code: str = "en-IN"):
         logger.error("SarvamAI client not available.")
         return None
     
+    # Check for empty text
+    if not text or not text.strip():
+        logger.error("TTS: Empty text provided, cannot generate speech")
+        return None
+    
     logger.info(f"Sending to TTS: '{text}' in language: {language_code}")
     try:
         response = sarvam_client.text_to_speech.convert(
@@ -1217,7 +1591,11 @@ def convert_text_to_speech(text: str, language_code: str = "en-IN"):
             target_language_code=language_code,
             speaker="anushka",
             model="bulbul:v2",
-            speech_sample_rate=8000
+            speech_sample_rate=22050,  # Higher quality sample rate
+            enable_preprocessing=True,  # Enable preprocessing for better quality
+            loudness=1,  # Optimal loudness
+            pace=1,  # Normal pace
+            pitch=0  # Normal pitch
         )
         
         audio_chunks_base64 = response.audios
