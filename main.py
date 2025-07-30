@@ -114,7 +114,7 @@ async def handle_incoming_call(request: Request):
     # The <Connect> verb will establish a media stream
     connect = Connect()
     # IMPORTANT: Replace with your actual ngrok URL
-    connect.stream(url="wss://5fd4c229db5f.ngrok-free.app/ws")
+    connect.stream(url="wss://dcd4efdaa0d1.ngrok-free.app/ws")
     twiml_response.append(connect)
     
     logger.info("Responding with TwiML to connect to WebSocket.")
@@ -178,6 +178,10 @@ async def websocket_endpoint(websocket: WebSocket):
                             # We default to 'en-IN' if the language code is not available.
                             detected_language = getattr(transcription, 'language_code', 'en-IN')
                             logger.info(f"Detected language: {detected_language}")
+                            
+                            # FORCE en-IN for consistent pronunciation
+                            tts_language = 'en-IN'
+                            logger.info(f"Using TTS language: {tts_language} (forced for consistency)")
 
                             # 3. Get a response from the LLM
                             logger.info(f"LLM INPUT (Transcription): {transcription.transcript}")
@@ -190,10 +194,10 @@ async def websocket_endpoint(websocket: WebSocket):
                                 logger.info(f"LLM OUPUT (Response): {llm_response_text}")
                                 
                                 # 4. Convert the LLM's text response to speech
-                                # NEW: Pass the detected language to the TTS function.
+                                # Use consistent TTS settings like chat mode
                                 response_audio_wav = convert_text_to_speech(
                                     llm_response_text,
-                                    language_code=detected_language
+                                    language_code=tts_language
                                 )
 
                                 if response_audio_wav:
@@ -216,24 +220,29 @@ async def websocket_endpoint(websocket: WebSocket):
                                             log_file.write(response_audio_mulaw)
                                         logger.info(f"Saved final mulaw stream to: {mulaw_log_filename}")
 
-                                        # 6. Send audio back to Twilio
-                                        payload = base64.b64encode(response_audio_mulaw).decode("utf-8")
+                                        # 6. Send audio back to Twilio in smaller chunks for better quality
+                                        chunk_size = 160  # 20ms of audio at 8kHz
+                                        total_chunks = len(response_audio_mulaw) // chunk_size
                                         
-                                        # --- Start of Final Verification Log ---
-                                        logger.info("Preparing to send media response to Twilio.")
-                                        logger.info(f"  - Event: media")
-                                        logger.info(f"  - Stream SID: {stream_sid}")
-                                        logger.info(f"  - Payload Length (chars): {len(payload)}")
-                                        # --- End of Final Verification Log ---
+                                        logger.info(f"Sending {total_chunks} audio chunks to Twilio")
                                         
-                                        await websocket.send_json({
-                                            "event": "media",
-                                            "streamSid": stream_sid,
-                                            "media": {
-                                                "payload": payload
-                                            }
-                                        })
-                                        logger.info("Sent audio response back to Twilio.")
+                                        for i in range(0, len(response_audio_mulaw), chunk_size):
+                                            chunk = response_audio_mulaw[i:i + chunk_size]
+                                            payload = base64.b64encode(chunk).decode("utf-8")
+                                            
+                                            await websocket.send_json({
+                                                "event": "media",
+                                                "streamSid": stream_sid,
+                                                "media": {
+                                                    "payload": payload
+                                                }
+                                            })
+                                            
+                                            # Small delay between chunks for better streaming
+                                            import asyncio
+                                            await asyncio.sleep(0.02)  # 20ms delay
+                                        
+                                        logger.info(f"Sent {total_chunks} audio chunks to Twilio")
 
                     # --- End of Conversational Loop ---
                     
@@ -329,8 +338,8 @@ async def chat_websocket_endpoint(websocket: WebSocket):
                             "message": llm_response
                         })
                         
-                        # Generate and send audio response
-                        audio_response = convert_text_to_speech(llm_response, language_code=detected_language)
+                        # Generate and send audio response - use same settings as chat
+                        audio_response = convert_text_to_speech(llm_response, language_code='en-IN')
                         if audio_response:
                             audio_base64 = base64.b64encode(audio_response).decode('utf-8')
                             await websocket.send_json({
@@ -435,8 +444,8 @@ async def chat_audio_endpoint(audio_file: UploadFile = File(...), language_code:
         # Get LLM response
         llm_response = get_llm_response(transcription.transcript, detected_language)
         
-        # Generate audio response
-        audio_response = convert_text_to_speech(llm_response, detected_language)
+        # Generate audio response - use same settings as chat
+        audio_response = convert_text_to_speech(llm_response, 'en-IN')
         audio_base64 = None
         if audio_response:
             audio_base64 = base64.b64encode(audio_response).decode('utf-8')
@@ -527,30 +536,55 @@ def convert_mulaw_to_wav_bytes(mulaw_bytes: bytes) -> bytes:
 def convert_wav_to_mulaw_bytes(wav_bytes: bytes) -> bytes:
     """
     Converts a standard 16-bit PCM WAV file into raw, headerless 8kHz µ-law
-    bytes suitable for the Twilio media stream, using the standard audioop library.
+    bytes suitable for the Twilio media stream, with better quality processing.
     """
     try:
         # 1. Read the raw PCM audio frames from the WAV file bytes
         with wave.open(io.BytesIO(wav_bytes), 'rb') as wf:
-            # Ensure audio is 16-bit mono PCM, which is what lin2ulaw expects.
-            if wf.getsampwidth() != 2 or wf.getnchannels() != 1:
-                logger.error(
-                    f"Unsupported WAV format: "
-                    f"Sample width {wf.getsampwidth()}, channels {wf.getnchannels()}. "
-                    f"Expected 16-bit mono."
-                )
-                return None
+            sample_width = wf.getsampwidth()
+            channels = wf.getnchannels()
+            framerate = wf.getframerate()
             
-            # The TTS service should already provide 8kHz, but we log a warning if not.
-            if wf.getframerate() != 8000:
-                logger.warning(f"WAV sample rate is {wf.getframerate()}, not 8000Hz.")
-
+            logger.info(f"Input WAV: {sample_width*8}-bit, {channels} channels, {framerate}Hz")
+            
             pcm_frames = wf.readframes(wf.getnframes())
 
-        # 2. Convert the 16-bit linear PCM data to 8-bit µ-law.
-        # The '2' indicates the sample width of the input data is 2 bytes (16-bit).
+        # 2. Convert to mono if stereo
+        if channels == 2:
+            pcm_frames = audioop.tomono(pcm_frames, sample_width, 1, 1)
+            logger.info("Converted stereo to mono")
+        
+        # 3. Resample to 8kHz if needed
+        if framerate != 8000:
+            pcm_frames = audioop.ratecv(pcm_frames, sample_width, 1, framerate, 8000, None)[0]
+            logger.info(f"Resampled from {framerate}Hz to 8000Hz")
+        
+        # 4. Convert to 16-bit if needed
+        if sample_width != 2:
+            if sample_width == 1:
+                pcm_frames = audioop.lin2lin(pcm_frames, 1, 2)
+            elif sample_width == 4:
+                pcm_frames = audioop.lin2lin(pcm_frames, 4, 2)
+            logger.info(f"Converted from {sample_width*8}-bit to 16-bit")
+
+        # 5. Apply volume normalization for better quality
+        try:
+            # Get max amplitude
+            max_amp = audioop.max(pcm_frames, 2)
+            if max_amp > 0:
+                # Normalize to 80% of max to prevent clipping
+                target_amp = int(32767 * 0.8)
+                if max_amp < target_amp:
+                    factor = target_amp / max_amp
+                    pcm_frames = audioop.mul(pcm_frames, 2, factor)
+                    logger.info(f"Applied volume normalization: factor {factor:.2f}")
+        except Exception as e:
+            logger.warning(f"Volume normalization failed: {e}")
+
+        # 6. Convert the 16-bit linear PCM data to 8-bit µ-law
         mulaw_bytes = audioop.lin2ulaw(pcm_frames, 2)
         
+        logger.info(f"Final mulaw output: {len(mulaw_bytes)} bytes")
         return mulaw_bytes
 
     except Exception as e:
@@ -1592,6 +1626,8 @@ Create a natural, flowing response that sounds professional when spoken aloud.""
             gemini_prompt = f"""
 You are a professional financial assistant. Create clear, helpful responses optimized for text-to-speech.
 
+CRITICAL: Use PLAIN TEXT only. NO markdown formatting (**, *, #, bullets). This will be spoken aloud.
+
 CONTEXT:
 - User asked: "{text}"
 - Tool used: {tool_name}
@@ -1729,6 +1765,8 @@ Create a natural, flowing response that sounds professional when spoken aloud.""
                 gemini_final_prompt = f"""
 You are a professional financial assistant. Create clear, helpful responses optimized for text-to-speech.
 
+CRITICAL: Use PLAIN TEXT only. NO markdown formatting (**, *, #, bullets). This will be spoken aloud.
+
 CONTEXT:
 - User asked: "{text}"
 - Tool used: {tool_name}
@@ -1859,6 +1897,24 @@ Focus on being helpful rather than entertaining.
         return "I'm sorry, I had trouble processing your request."
 
 # --- SarvamAI Text-to-Speech (TTS) Function ---
+def clean_text_for_tts(text: str) -> str:
+    """Clean text to remove markdown and make it TTS-friendly"""
+    import re
+    
+    # Remove markdown formatting
+    text = re.sub(r'\*\*([^*]+)\*\*', r'\1', text)  # **bold** -> bold
+    text = re.sub(r'\*([^*]+)\*', r'\1', text)      # *italic* -> italic
+    text = re.sub(r'`([^`]+)`', r'\1', text)        # `code` -> code
+    text = re.sub(r'#{1,6}\s*', '', text)           # Remove # headers
+    text = re.sub(r'\[([^\]]+)\]\([^)]+\)', r'\1', text)  # [text](link) -> text
+    
+    # Clean up extra whitespace and newlines
+    text = re.sub(r'\n+', '. ', text)               # Multiple newlines -> period space
+    text = re.sub(r'\s+', ' ', text)                # Multiple spaces -> single space
+    text = text.strip()
+    
+    return text
+
 def convert_text_to_speech(text: str, language_code: str = "en-IN"):
     """
     Converts text to speech using SarvamAI, correctly combines all audio chunks, 
@@ -1873,18 +1929,26 @@ def convert_text_to_speech(text: str, language_code: str = "en-IN"):
         logger.error("TTS: Empty text provided, cannot generate speech")
         return None
     
-    logger.info(f"Sending to TTS: '{text}' in language: {language_code}")
+    # Clean text for TTS (remove markdown formatting)
+    clean_text = clean_text_for_tts(text)
+    
+    logger.info(f"🎤 TTS REQUEST:")
+    logger.info(f"  Original: '{text[:100]}{'...' if len(text) > 100 else ''}'")
+    logger.info(f"  Cleaned: '{clean_text[:100]}{'...' if len(clean_text) > 100 else ''}'")
+    logger.info(f"  Language: {language_code}")
+    logger.info(f"  Speaker: anushka, Model: bulbul:v2, Rate: 22050")
+    
     try:
         response = sarvam_client.text_to_speech.convert(
-            text=text,
+            text=clean_text,  # Use cleaned text instead of original
             target_language_code=language_code,
             speaker="anushka",
             model="bulbul:v2",
-            speech_sample_rate=22050,  # Higher quality sample rate
-            enable_preprocessing=True,  # Enable preprocessing for better quality
-            loudness=1,  # Optimal loudness
-            pace=1,  # Normal pace
-            pitch=0  # Normal pitch
+            speech_sample_rate=22050,  # HIGH QUALITY like chat mode
+            enable_preprocessing=True,
+            loudness=1,
+            pace=1,  # NORMAL pace like chat mode
+            pitch=0
         )
         
         audio_chunks_base64 = response.audios
